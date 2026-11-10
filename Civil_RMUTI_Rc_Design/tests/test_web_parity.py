@@ -27,6 +27,8 @@ CASES: list[tuple[str, dict]] = [
     ("column", {"width": "abc", "cover": 200}),
     ("column", {"width": 120, "depth": 400, "cover": 20}),
     ("column", {"width": "2,5", "depth": "1,200.5", "cover": 0.5}),
+    ("column", {"tie_type": "Spiral"}),
+    ("column", {"bar_count": 2.5}),
     ("beam", {}),
     ("beam", {"width": 600, "depth": 400}),
     ("beam", {"cover": 300, "moment_positive": -1}),
@@ -43,8 +45,34 @@ CASES: list[tuple[str, dict]] = [
 ]
 
 
-def _python_case(dt_value: str, overrides: dict) -> dict:
+# Column design checks per ACI 318-19: (project settings, member inputs).
+COLUMN_ACI_CASES: list[tuple[dict, dict]] = [
+    ({}, {}),
+    ({}, {"axial_load": 1500, "m1_m2": 0}),
+    ({}, {"axial_load": 5000, "m1_m2": 0, "tie_diameter": 9, "tie_spacing": 400}),
+    ({"unit_system": "MKS"}, {"axial_load": 150000, "m1_m2": 0.5, "bar_count": 4,
+                              "bar_diameter": 12}),
+    ({}, {"frame_type": "Sway (unbraced)", "k_factor": 1.5, "moment_x": 20}),
+    ({}, {"bar_count": 12, "bar_diameter": 36, "width": 500, "depth": 600,
+          "tie_diameter": 12, "m1_m2": 0.2}),
+    ({}, {"shape": "Circular", "width": 400, "cover": 40, "tie_type": "Spiral",
+          "bar_count": 6, "bar_diameter": 20, "tie_diameter": 10, "tie_spacing": 50,
+          "axial_load": 2000, "m1_m2": 0}),
+    ({}, {"shape": "Circular", "width": 400, "cover": 40, "tie_type": "Spiral",
+          "bar_count": 6, "bar_diameter": 20, "tie_diameter": 12, "tie_spacing": 50,
+          "axial_load": 2000, "m1_m2": 0}),
+    ({}, {"shape": "Circular", "width": 600, "cover": 40, "tie_type": "Spiral",
+          "bar_count": 5, "bar_diameter": 25, "tie_diameter": 9, "tie_spacing": 120,
+          "axial_load": 100}),
+]
+
+
+def _python_case(dt_value: str, overrides: dict, settings: dict | None = None) -> dict:
     project = Project()
+    if settings:
+        project.settings.design_standard = settings.get(
+            "design_standard", project.settings.design_standard)
+        project.settings.unit_system = settings.get("unit_system", project.settings.unit_system)
     design_type = DesignType(dt_value)
     member = DESIGN_REGISTRY[design_type].create_member(project)
     member.inputs.update(overrides)
@@ -57,6 +85,7 @@ def _python_case(dt_value: str, overrides: dict) -> dict:
         out["items"] = [[i.label, i.value, i.unit, i.note, i.formatted_value()] for i in result.items]
         out["messages"] = result.messages
         out["status"] = result.status.value
+        out["summary"] = result.summary
     return out
 
 
@@ -119,6 +148,44 @@ process.stdout.write(JSON.stringify(out));
                 for js_item, py_item in zip(js["items"], py["items"]):
                     self.assertEqual(js_item[0], py_item[0])
                     self.assertAlmostEqual(js_item[1], py_item[1], places=9)
+                    self.assertEqual(js_item[2:], py_item[2:])
+
+    def test_column_aci_design_matches(self) -> None:
+        script = """
+const RC = require(process.argv[2]);
+const cases = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const out = cases.map(([settings, overrides]) => {
+  const p = RC.newProject({project_name: 'T'}, settings);
+  const m = RC.newMember(p, 'column');
+  Object.assign(m.inputs, overrides);
+  RC.members(p, 'column').push(m);
+  const v = RC.validateMember(p, 'column', m);
+  const o = {errors: v.errors, warnings: v.warnings, items: null};
+  if (!v.errors.length) {
+    const r = RC.calculate(p, 'column', m).result;
+    o.items = r.items.map(i => [i.label, i.value, i.unit, i.note, RC.formatValue(i.value)]);
+    o.messages = r.messages; o.status = r.status; o.summary = r.summary;
+  }
+  return o;
+});
+process.stdout.write(JSON.stringify(out));
+"""
+        cases = [({"design_standard": "ACI 318-19", **settings}, inputs)
+                 for settings, inputs in COLUMN_ACI_CASES]
+        js_results = self._node(script, cases)
+        for (settings, inputs), js in zip(cases, js_results):
+            with self.subTest(settings=settings, inputs=inputs):
+                py = _python_case("column", inputs, settings)
+                self.assertEqual(js["errors"], py["errors"])
+                self.assertEqual(js["warnings"], py["warnings"])
+                self.assertIsNotNone(py["items"])
+                self.assertEqual(js["status"], py["status"])
+                self.assertEqual(js["summary"], py["summary"])
+                self.assertEqual(js["messages"], py["messages"])
+                self.assertEqual(len(js["items"]), len(py["items"]))
+                for js_item, py_item in zip(js["items"], py["items"]):
+                    self.assertEqual(js_item[0], py_item[0])
+                    self.assertAlmostEqual(js_item[1], py_item[1], places=6)
                     self.assertEqual(js_item[2:], py_item[2:])
 
     def test_web_file_opens_in_desktop_and_back(self) -> None:
