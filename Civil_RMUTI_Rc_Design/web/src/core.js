@@ -170,6 +170,12 @@
       if (2 * v.cover >= least) {
         r.errors.push(`Column concrete cover (${g(v.cover)} mm) is too large for the least section dimension (${g(least)} mm).`);
       }
+      if (v.tie_type === "Spiral" && v.shape !== "Circular") {
+        r.errors.push("Column spiral reinforcement is only supported for circular sections.");
+      }
+      if (v.tie_diameter + v.bar_diameter + v.cover >= least / 2) {
+        r.errors.push("Column bars and cover do not fit in the section.");
+      }
       if (least < 150) r.warnings.push(`Least column dimension ${g(least)} mm is unusually small.`);
     },
     beam(v, r) {
@@ -233,7 +239,90 @@
 
   const ENGINES = {
     column: {
-      name: "Column engine v0.1 (geometry)",
+      name: "Column engine v1.0 (ACI 318-19 short column, axial)",
+      supported: ["ACI 318-19"],
+      /** ColumnCalculationEngine._run_aci - keep identical to Python. */
+      run(v, units, standard, concrete, main, tie) {
+        const k2m = SPEC.app.ksc_to_mpa;
+        const toN = (x) => x * (units === "SI" ? 1000 : 9.80665);
+        const fromN = (x) => x / (units === "SI" ? 1000 : 9.80665);
+        const ok = (f) => (f ? "OK" : "NOT OK");
+        const fu = unitLabel("force", units);
+        const circular = v.shape === "Circular";
+        const spiral = v.tie_type === "Spiral";
+        const b = v.width, lu = v.clear_height, cover = v.cover;
+        const n = Math.trunc(v.bar_count), db = v.bar_diameter, dt = v.tie_diameter, s = v.tie_spacing, k = v.k_factor;
+        const fc = concrete.fc_ksc * k2m, fy = main.fy_ksc * k2m, fyt = tie.fy_ksc * k2m;
+        const items = [], failures = [], scope = [];
+        let ag, least;
+        if (circular) { ag = Math.PI * b * b / 4; least = b; } else { ag = b * v.depth; least = Math.min(b, v.depth); }
+        items.push(item("Gross section area Ag", ag, "mm²", `= ${grouped(ag / 100, 1)} cm²`));
+        const fcOk = fc >= 17.0;
+        items.push(item("Concrete f'c", fc, "MPa", `min 17 MPa, ACI 19.2.1.1 - ${ok(fcOk)}`));
+        const fyOk = fy <= 550.0;
+        items.push(item(`Main bar fy (${main.name})`, fy, "MPa", `max 550 MPa, ACI Table 20.2.2.4(a) - ${ok(fyOk)}`));
+        if (!fcOk) failures.push(`f'c = ${fc.toFixed(2)} MPa is below the minimum 17 MPa (ACI 318-19 19.2.1.1).`);
+        if (!fyOk) failures.push(`fy = ${fy.toFixed(1)} MPa exceeds 550 MPa (ACI 318-19 Table 20.2.2.4(a)).`);
+        const ast = n * Math.PI * db * db / 4;
+        const rho = ast / ag;
+        items.push(item("Longitudinal steel Ast", ast, "mm²", `${n} bars x ${g(db)} mm`));
+        const rhoOk = rho >= 0.01 && rho <= 0.08;
+        items.push(item("Reinforcement ratio ρg = Ast/Ag", rho * 100, "%", `1-8 %, ACI 10.6.1.1 - ${ok(rhoOk)}`));
+        if (!rhoOk) failures.push(`ρg = ${(rho * 100).toFixed(2)} % is outside 1-8 % (ACI 318-19 10.6.1.1).`);
+        const minBars = spiral ? 6 : 4;
+        const barsOk = n >= minBars;
+        items.push(item("Number of longitudinal bars", n, "-", `min ${minBars}, ACI 10.7.3.1 - ${ok(barsOk)}`));
+        if (!barsOk) failures.push(`${n} longitudinal bars < minimum ${minBars} for ${spiral ? "spirals" : "ties"} (ACI 318-19 10.7.3.1).`);
+        const po = 0.85 * fc * (ag - ast) + fy * ast;
+        const pnf = spiral ? 0.85 : 0.80;
+        const phi = spiral ? 0.75 : 0.65;
+        const pnMax = pnf * po, phiPn = phi * pnMax, pu = toN(v.axial_load);
+        items.push(item("Po = 0.85f'c(Ag-Ast) + fy·Ast", fromN(po), fu, "ACI Eq. 22.4.2.2"));
+        items.push(item(`Pn,max = ${pnf.toFixed(2)}·Po`, fromN(pnMax), fu, "ACI Table 22.4.2.1"));
+        items.push(item("Strength reduction factor φ", phi, "-", `${spiral ? "spiral" : "tied"}, ACI Table 21.2.2`));
+        items.push(item("Design strength φPn,max", fromN(phiPn), fu, "ACI 22.4.2.1"));
+        items.push(item("Factored axial load Pu", fromN(pu), fu));
+        const ratio = pu / phiPn, axialOk = pu <= phiPn;
+        items.push(item("Demand / capacity Pu/φPn,max", ratio, "-", ok(axialOk)));
+        if (!axialOk) failures.push("Pu exceeds φPn,max (ACI 318-19 22.4.2.1).");
+        if (spiral) {
+          const sizeOk = dt >= 9.5;
+          items.push(item("Spiral bar diameter", dt, "mm", `min 9.5 mm, ACI 25.7.3.2 - ${ok(sizeOk)}`));
+          if (!sizeOk) failures.push(`Spiral diameter ${g(dt)} mm < 9.5 mm (ACI 318-19 25.7.3.2).`);
+          const clear = s - dt, clearOk = clear >= 25 && clear <= 75;
+          items.push(item("Spiral clear spacing", clear, "mm", `25-75 mm, ACI 25.7.3.1 - ${ok(clearOk)}`));
+          if (!clearOk) failures.push(`Spiral clear spacing ${g(clear)} mm is outside 25-75 mm (ACI 318-19 25.7.3.1).`);
+          if (fyt > 700) failures.push(`Spiral fyt = ${fyt.toFixed(1)} MPa exceeds 700 MPa (ACI 318-19 Table 20.2.2.4(a)).`);
+          const dc = b - 2 * cover, ach = Math.PI * dc * dc / 4, asp = Math.PI * dt * dt / 4;
+          const rs = 4 * asp / (dc * s), rsMin = 0.45 * (ag / ach - 1) * fc / fyt, rsOk = rs >= rsMin;
+          items.push(item("Spiral ratio ρs = 4Asp/(Dc·s)", rs, "-", `fyt (${tie.name}) = ${fyt.toFixed(1)} MPa`));
+          items.push(item("Minimum ρs = 0.45(Ag/Ach-1)f'c/fyt", rsMin, "-", `ACI Eq. 25.7.3.3 - ${ok(rsOk)}`));
+          if (!rsOk) failures.push(`Spiral ratio ${rs.toFixed(4)} < required ${rsMin.toFixed(4)} (ACI 318-19 25.7.3.3).`);
+        } else {
+          const dtMin = db <= 32.3 ? 9.5 : 12.7, sizeOk = dt >= dtMin;
+          items.push(item("Tie bar diameter", dt, "mm", `min ${g(dtMin)} mm, ACI 25.7.2.2 - ${ok(sizeOk)}`));
+          if (!sizeOk) failures.push(`Tie diameter ${g(dt)} mm < ${g(dtMin)} mm (ACI 318-19 25.7.2.2).`);
+          const sMax = Math.min(16 * db, 48 * dt, least), sOk = s <= sMax;
+          items.push(item("Maximum tie spacing", sMax, "mm", "min(16db, 48dt, least dim.), ACI 25.7.2.1(b)"));
+          items.push(item("Tie spacing s", s, "mm", ok(sOk)));
+          if (!sOk) failures.push(`Tie spacing ${g(s)} mm > ${g(sMax)} mm (ACI 318-19 25.7.2.1).`);
+        }
+        const r = circular ? 0.25 * b : 0.30 * least;
+        const sl = k * lu / r;
+        let limit, note;
+        if (v.frame_type === "Sway (unbraced)") { limit = 22.0; note = "sway: 22, ACI 6.2.5.1(a)"; }
+        else { limit = Math.min(34.0 + 12.0 * v.m1_m2, 40.0); note = "nonsway: min(34+12·M1/M2, 40), ACI 6.2.5.1(b),(c)"; }
+        items.push(item("Radius of gyration r", r, "mm", "0.25D (circular) / 0.30h (rectangular), ACI 6.2.5.2"));
+        const shortOk = sl <= limit;
+        items.push(item("Slenderness k·Lu/r", sl, "-", `limit ${limit.toFixed(1)} (${note}) - ${shortOk ? "short column" : "SLENDER"}`));
+        if (!shortOk) scope.push(`k·Lu/r = ${sl.toFixed(1)} > ${limit.toFixed(1)}: slenderness effects must be considered (ACI 318-19 6.6/6.7). Slender column design is not implemented yet.`);
+        if (v.moment_x !== 0 || v.moment_y !== 0) scope.push("Mux/Muy are not zero: combined axial force and moment (interaction diagram, ACI 318-19 22.4) is not implemented yet. Only the axial capacity was checked.");
+        let status, summary;
+        if (failures.length) { status = "fail"; summary = `Column: FAIL - ${failures.length} check(s) not satisfied (ACI 318-19).`; }
+        else if (scope.length) { status = "not_implemented"; summary = "Column: axial checks OK, but the member is outside the implemented scope."; }
+        else { status = "pass"; summary = `Column: PASS - Pu/φPn,max = ${ratio.toFixed(3)} (ACI 318-19, short column).`; }
+        return { status, summary, items, messages: [...failures, ...scope, "Scope: short column, concentric axial load, ACI 318-19 (SI)."] };
+      },
       items(v) {
         const w = v.width, h = v.clear_height;
         let area, perimeter, least;
@@ -317,10 +406,16 @@
     const units = project.design_settings.unit_system;
     const standard = project.design_settings.design_standard;
     const engine = ENGINES[dtValue];
-    const items = engine.items(values, units);
     const k = SPEC.app.ksc_to_mpa;
     const concrete = findConcrete(project, member.concrete);
     const main = findGrade(project, member.main_rebar);
+    const tie = findGrade(project, member.tie_rebar);
+    // Module engines with design checks (CalculationEngine.supports).
+    if (engine.run && (engine.supported || []).includes(standard) && concrete && main && tie) {
+      const res = engine.run(values, units, standard, concrete, main, tie);
+      return Object.assign(res, { standard, engine: engine.name, calculated_at: nowIso() });
+    }
+    const items = engine.items(values, units);
     if (concrete) items.push(item("Concrete f'c", concrete.fc_ksc, "ksc", `= ${(concrete.fc_ksc * k).toFixed(2)} MPa`));
     if (main) items.push(item(`Main bar fy (${main.name})`, main.fy_ksc, "ksc", `= ${(main.fy_ksc * k).toFixed(1)} MPa`));
     return {
